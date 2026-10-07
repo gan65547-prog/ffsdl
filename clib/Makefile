@@ -55,7 +55,7 @@ LDFLAGS += -Wl,-rpath,'$$ORIGIN/../third_party/ffmpeg-$(FFMPEG_VERSION)/lib' \
 endif
 
 SOURCES := src/memory/ml_pool.c \
-           src/memory/ml_frame.c src/runtime/ml_thread.c src/io/ml_camera.c \
+           src/memory/ml_frame.c src/io/ml_camera.c \
            src/io/ml_camera_rtsp.c src/io/ml_mpp_decoder.c src/io/ml_camera_stub.c \
            src/platform/ml_display_sdl.c $(RGA_SRC)
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
