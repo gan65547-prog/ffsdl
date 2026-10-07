@@ -1,0 +1,12 @@
+/build/
+/build-*/
+/clib/build/
+/clib/libclib.so
+/clib/libclib.dylib
+/clib/libclib.a
+/.DS_Store
+**/.DS_Store
+*.core
+*.dSYM/
+# Board image/runtime bundle; contains large system libraries (including LLVM).
+/third_party/lib/
