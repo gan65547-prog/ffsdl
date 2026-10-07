@@ -1,7 +1,7 @@
 # RK3568 FFmpeg + SDL2 RTSP HDMI 输出
 
-本项目播放 H.264/H.265 RTSP 流：FFmpeg 解复用与解码，板端可优先使用
-`h264_rkmpp` / `hevc_rkmpp`；RGA 将图像转换为 BGR888；SDL2 负责显示。
+本项目播放 H.264/H.265 RTSP 流：FFmpeg 负责解复用，Linux 板端优先直接调用
+Rockchip MPP 做硬件解码；RGA 将图像转换为 BGR888；SDL2 负责显示。
 
 入口是 `src/clib_rtsp_sdl_player.c`。`clib/` 是仅包含本 demo 所需 RTSP、帧池、
 RKMPP/RGA 与 SDL2 适配代码的最小提取。FFmpeg 4.3 起的 ABI 要求由项目的
@@ -17,21 +17,19 @@ RKMPP/RGA 与 SDL2 适配代码的最小提取。FFmpeg 4.3 起的 ABI 要求由
 | `4.3` | `third_party/ffmpeg-4.3` | `libavcodec.so.58`、`libavformat.so.58` | 兼容旧板端环境 |
 | `6.1` | `third_party/ffmpeg-6.1` | `libavcodec.so.60`、`libavformat.so.60` | 新版板端/RKMPP 环境 |
 
-代码使用 C11、POSIX、SDL2、DRM/GBM、Rockchip MPP 和 RGA 接口。只有 FFmpeg 构建时
-包含 `h264_rkmpp`/`hevc_rkmpp` 且板端 MPP 驱动可用时，才会启用硬件解码；否则回退到软件解码。
+代码使用 C11、POSIX、SDL2、DRM/GBM、Rockchip MPP 和 RGA 接口。Linux 板端优先使用
+直接 MPP 解码；MPP 不可用时才回退到 FFmpeg 的 `h264_rkmpp`/`hevc_rkmpp` 或软件解码。
 
-注意：FFmpeg 4.3 这个版本号本身并不禁止 RKMPP。FFmpeg 4.3 同样可以通过编译选项
-`--enable-rkmpp` 并链接 Rockchip MPP 来支持硬件解码。当前项目附带的 FFmpeg 4.3
-运行库没有编译进 RKMPP，因此 4.3 构建会使用软件解码；当前附带的 FFmpeg 6.1
-运行库包含 RKMPP，因此 6.1 构建可以使用硬件解码。请用以下命令检查某个 FFmpeg
-构建是否包含 RKMPP：
+注意：当前方案不依赖 FFmpeg 4.3 的 `h264_rkmpp` 补丁包。FFmpeg 4.3 负责 RTSP
+解复用，新增的 `ml_mpp_decoder.c` 直接调用板端 MPP 完成硬件解码。请用以下命令检查
+FFmpeg 自身是否包含 RKMPP：
 
 ```bash
 ffmpeg -hide_banner -decoders | grep rkmpp
 ```
 
-看到 `h264_rkmpp` 或 `hevc_rkmpp` 才表示对应编码格式可使用 RKMPP；没有输出时，
-程序会回退到软件解码。
+看到 `h264_rkmpp` 或 `hevc_rkmpp` 表示 FFmpeg 自身支持对应 RKMPP 解码器；当前 Linux
+板端即使没有该 FFmpeg 解码器，也可以使用项目的直接 MPP 路径。
 
 `FFMPEG_VERSION` 只接受 `4.3` 或 `6.1`，每个版本建议使用独立的 build 目录：
 
@@ -43,6 +41,9 @@ ctest --test-dir build-43 --output-on-failure
 cmake -S event -B build-61 -DFFMPEG_VERSION=6.1 -DBUILD_TESTING=ON
 cmake --build build-61 -j
 ctest --test-dir build-61 --output-on-failure
+
+# 108 板端当前 FFmpeg 4.3 配置的最终编译命令
+cmake --build build-board-43-rkmpp --target ffsdl
 ```
 
 切换 SDK 后如果复用了同一个 `clib` 构建目录，必须先清理旧对象，避免旧版本头文件
@@ -162,12 +163,12 @@ sudo apt-get install -y \
 ### 部署方式
 
 在 ARM64 编译机或 108 板端编译完成后，将同一版本的可执行文件、clib 动态库和 SDK 运行库复制到板端。
-以下以 FFmpeg 6.1 为例：
+以下以 FFmpeg 4.3 为例：
 
 ```bash
-scp build-61/ffsdl build-61/test_clib_sdl_display clib/libclib.so \
+scp build-board-43-rkmpp/ffsdl build-board-43-rkmpp/test_clib_sdl_display clib/libclib.so \
   gan@<板端IP>:/tmp/ffsdl-runtime/
-scp -r third_party/lib third_party/ffmpeg-6.1/lib \
+scp -r third_party/lib third_party/ffmpeg-4.3/lib \
   gan@<板端IP>:/tmp/ffsdl-runtime/third_party/
 ```
 
@@ -178,7 +179,7 @@ scp -r third_party/lib third_party/ffmpeg-6.1/lib \
 /tmp/ffsdl-runtime/libclib.so
 /tmp/ffsdl-runtime/test_clib_sdl_display
 /tmp/ffsdl-runtime/third_party/lib/aarch64-linux-gnu/
-/tmp/ffsdl-runtime/third_party/ffmpeg-6.1/lib/
+/tmp/ffsdl-runtime/third_party/ffmpeg-4.3/lib/
 ```
 
 ### 运行方式
@@ -188,7 +189,7 @@ scp -r third_party/lib third_party/ffmpeg-6.1/lib \
 ```bash
 export LIBGL_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri
 export EGL_PLATFORM=gbm
-export LD_LIBRARY_PATH=$PWD/third_party/ffmpeg-6.1/lib:$PWD/third_party/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:$PWD:/opt/mlfw-dev/mlfw/lib
+export LD_LIBRARY_PATH=$PWD/third_party/ffmpeg-4.3/lib:$PWD/third_party/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:$PWD:/opt/mlfw-dev/mlfw/lib
 
 # SDL2 显示接口测试（无显示器）
 SDL_VIDEODRIVER=dummy ./test_clib_sdl_display
@@ -225,14 +226,13 @@ export SDL_KMSDRM_DEVICE_INDEX=0
 export FFSDL_DISABLE_RKMPP=1
 ```
 
-未设置该变量时程序会尝试 `h264_rkmpp`/`hevc_rkmpp`，失败后回退软件解码。
+未设置该变量时程序会优先尝试直接 MPP，失败后再尝试 FFmpeg RKMPP 或软件解码。
 
 ### 当前验收记录
 
-在 108（aarch64）上，FFmpeg 6.1 版本已验证：dummy 显示测试通过，真实 RTSP/KMS
-启动成功，并输出 `decoder=h264_rkmpp mode=hardware stream=1280x720`。FFmpeg 4.3
-版本已在本机和 108 上通过构建及 dummy 显示测试；只有替换为带 RKMPP 的 FFmpeg 4.3
-运行库后，才能宣称完成 4.3 + RKMPP 的真实 RTSP/KMS 验证。
+在 108（aarch64）上，FFmpeg 4.3 版本已通过构建、dummy 显示测试和真实 RTSP 拉流测试，
+输出 `decoder=mpp_direct mode=hardware stream=1280x720`，连续 10 秒输出超过 100 帧。
+FFmpeg 6.1 已通过本机配置、编译和 CTest 兼容性检查。
 
 例如使用 RTSP 测试流：
 
