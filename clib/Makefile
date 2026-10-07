@@ -5,6 +5,7 @@ AR ?= ar
 PROJECT_ROOT ?= $(abspath $(CURDIR)/..)
 THIRD_PARTY_ROOT ?= $(CURDIR)/../third_party
 FFMPEG_ROOT ?=
+FFMPEG_VERSION ?= 4.3
 SDL2_ROOT ?=
 
 CFLAGS := -D_GNU_SOURCE -DML_CAMERA_HAS_RTSP -fPIC -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
@@ -22,7 +23,7 @@ ifeq ($(UNAME_S),Darwin)
   SHARED := libclib.dylib
   SHARED_FLAGS := -dynamiclib -Wl,-install_name,@rpath/libclib.dylib
 else
-LDFLAGS += -Wl,-rpath,'$$ORIGIN/../third_party/ffmpeg-6.1/lib' \
+LDFLAGS += -Wl,-rpath,'$$ORIGIN/../third_party/ffmpeg-$(FFMPEG_VERSION)/lib' \
              -Wl,-rpath,'$$ORIGIN/../third_party/sdl2/lib' \
              -Wl,-rpath,'$$ORIGIN/../third_party/lib/aarch64-linux-gnu'
   ifneq ($(wildcard $(FFMPEG_ROOT)/include/libavformat/avformat.h),)
@@ -55,7 +56,7 @@ endif
 
 SOURCES := src/memory/ml_pool.c \
            src/memory/ml_frame.c src/runtime/ml_thread.c src/io/ml_camera.c \
-           src/io/ml_camera_rtsp.c src/io/ml_camera_stub.c \
+           src/io/ml_camera_rtsp.c src/io/ml_mpp_decoder.c src/io/ml_camera_stub.c \
            src/platform/ml_display_sdl.c $(RGA_SRC)
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 

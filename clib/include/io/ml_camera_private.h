@@ -29,6 +29,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 #endif
 
+#include "io/ml_mpp_decoder.h"
+
 #if defined(ML_CAMERA_HAS_FILE)
 #include <stdio.h>
 #endif
@@ -86,6 +88,7 @@ struct ml_camera_s {
     uint8_t         *rgb_buf;
     int              rgb_buf_size;
     int              hw_decoder;
+    ml_mpp_decoder_t *mpp_decoder;
     void            *rga;
     uint8_t         *rga_cvt_buf;
     int              rga_cvt_size;

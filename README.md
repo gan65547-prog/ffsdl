@@ -87,8 +87,8 @@ third_party/
 └── lib/aarch64-linux-gnu/
 ```
 
-项目默认将 `FFMPEG_VERSION` 设置为 `6.1`，并自动使用
-`third_party/ffmpeg-6.1`；SDL2 默认使用 `third_party/sdl2`。
+项目默认将 `FFMPEG_VERSION` 设置为 `4.3`，并自动使用
+`third_party/ffmpeg-4.3`；SDL2 默认使用 `third_party/sdl2`。
 
 Ubuntu 构建机安装基础开发依赖：
 
@@ -231,7 +231,8 @@ export FFSDL_DISABLE_RKMPP=1
 
 在 108（aarch64）上，FFmpeg 6.1 版本已验证：dummy 显示测试通过，真实 RTSP/KMS
 启动成功，并输出 `decoder=h264_rkmpp mode=hardware stream=1280x720`。FFmpeg 4.3
-版本已在本机通过 CTest，并在 108 上完成 RTSP/KMS 播放验证。
+版本已在本机和 108 上通过构建及 dummy 显示测试；只有替换为带 RKMPP 的 FFmpeg 4.3
+运行库后，才能宣称完成 4.3 + RKMPP 的真实 RTSP/KMS 验证。
 
 例如使用 RTSP 测试流：
 

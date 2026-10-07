@@ -5,7 +5,7 @@ include(CTest)
 
 set(CLIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/clib" CACHE PATH
   "Path to the bundled or external clib source tree")
-set(FFMPEG_VERSION "6.1" CACHE STRING "FFmpeg ABI selection: 4.3 or 6.1")
+set(FFMPEG_VERSION "4.3" CACHE STRING "FFmpeg ABI selection: 4.3 or 6.1")
 set_property(CACHE FFMPEG_VERSION PROPERTY STRINGS 4.3 6.1)
 if(NOT FFMPEG_VERSION STREQUAL "4.3" AND NOT FFMPEG_VERSION STREQUAL "6.1")
   message(FATAL_ERROR "FFMPEG_VERSION must be 4.3 or 6.1")
@@ -26,6 +26,7 @@ endif()
   if(FFMPEG_ROOT)
     list(APPEND CLIB_MAKE_ARGS "FFMPEG_ROOT=${FFMPEG_ROOT}")
   endif()
+  list(APPEND CLIB_MAKE_ARGS "FFMPEG_VERSION=${FFMPEG_VERSION}")
   if(FFMPEG_LINK_LIBS)
     list(APPEND CLIB_MAKE_ARGS "FFMPEG_LIBS=${FFMPEG_LINK_LIBS}")
   endif()
@@ -62,7 +63,7 @@ endif()
     # Keep a copied demo self-contained on the target: libclib.so lives next
     # to the executable in the deployment directory.
     set_target_properties(ffsdl PROPERTIES
-      BUILD_RPATH "$ORIGIN/../clib;$ORIGIN/../third_party/ffmpeg-6.1/lib;$ORIGIN/../third_party/sdl2/lib;$ORIGIN/../third_party/lib/aarch64-linux-gnu"
+      BUILD_RPATH "$ORIGIN/../clib;$ORIGIN/../third_party/ffmpeg-${FFMPEG_VERSION}/lib;$ORIGIN/../third_party/sdl2/lib;$ORIGIN/../third_party/lib/aarch64-linux-gnu"
       BUILD_WITH_INSTALL_RPATH FALSE
       INSTALL_RPATH "$ORIGIN")
   elseif(APPLE)
@@ -78,7 +79,7 @@ endif()
     endif()
     if(UNIX AND NOT APPLE)
       set_target_properties(test_clib_sdl_display PROPERTIES
-        BUILD_RPATH "$ORIGIN/../clib;$ORIGIN/../third_party/ffmpeg-6.1/lib;$ORIGIN/../third_party/sdl2/lib;$ORIGIN/../third_party/lib/aarch64-linux-gnu"
+        BUILD_RPATH "$ORIGIN/../clib;$ORIGIN/../third_party/ffmpeg-${FFMPEG_VERSION}/lib;$ORIGIN/../third_party/sdl2/lib;$ORIGIN/../third_party/lib/aarch64-linux-gnu"
         BUILD_WITH_INSTALL_RPATH FALSE
         INSTALL_RPATH "$ORIGIN")
     elseif(APPLE)

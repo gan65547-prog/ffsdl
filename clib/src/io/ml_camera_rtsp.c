@@ -204,17 +204,29 @@ static int rtsp_open(ml_camera_t *cam)
 
     codecpar = cam->fmt_ctx->streams[cam->video_idx]->codecpar;
 
-    /* select hardware decoder by codec type.
-     * Priority: rkmpp > v4l2m2m > software.
+    /* Prefer direct MPP on Linux. FFmpeg 4.3 remains responsible for RTSP
+     * demuxing, while the board MPP ABI handles hardware decode directly.
+     * Fallback priority: rkmpp > v4l2m2m > software.
      * h264_rkmpp: custom FFmpeg builds with --enable-rkmpp (RK MPP)
-     * h264_v4l2m2m: upstream V4L2 mem2mem stateless decoder (kernel 5.10+) */
+     * h264_v4l2m2m: upstream V4L2 mem2mem stateless decoder (kernel 5.10+). */
+    cam->mpp_decoder = NULL;
     cam->hw_decoder = 0;
     cam->decoder    = NULL;
 
     const char *disable_hw = getenv("FFSDL_DISABLE_RKMPP");
     int allow_hw = !(disable_hw && disable_hw[0] && strcmp(disable_hw, "0") != 0);
 
-    if (allow_hw && codecpar->codec_id == AV_CODEC_ID_H264) {
+#ifdef __linux__
+    if (allow_hw && (codecpar->codec_id == AV_CODEC_ID_H264 ||
+                     codecpar->codec_id == AV_CODEC_ID_HEVC)) {
+        cam->mpp_decoder = ml_mpp_decoder_create(codecpar->codec_id);
+    }
+#endif
+
+    if (cam->mpp_decoder) {
+        cam->decoder = avcodec_find_decoder(codecpar->codec_id);
+        cam->hw_decoder = 1;
+    } else if (allow_hw && codecpar->codec_id == AV_CODEC_ID_H264) {
         cam->decoder = avcodec_find_decoder_by_name("h264_rkmpp");
         if (!cam->decoder && v4l2_decoder_available())
             cam->decoder = avcodec_find_decoder_by_name("h264_v4l2m2m");
@@ -224,9 +236,9 @@ static int rtsp_open(ml_camera_t *cam)
             cam->decoder = avcodec_find_decoder_by_name("hevc_v4l2m2m");
     }
 
-    if (cam->decoder) {
+    if (!cam->mpp_decoder && cam->decoder) {
         cam->hw_decoder = 1;
-    } else {
+    } else if (!cam->mpp_decoder) {
         cam->decoder = avcodec_find_decoder(codecpar->codec_id);
         cam->hw_decoder = 0;
     }
@@ -268,7 +280,7 @@ static int rtsp_open(ml_camera_t *cam)
     if (!cam->hw_decoder)
         cam->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
-    ret = avcodec_open2(cam->codec_ctx, cam->decoder, NULL);
+    ret = cam->mpp_decoder ? 0 : avcodec_open2(cam->codec_ctx, cam->decoder, NULL);
     if (ret < 0 && cam->hw_decoder) {
         /* hardware decoder failed — fall back to software */
         cam->hw_decoder = 0;
@@ -302,7 +314,7 @@ static int rtsp_open(ml_camera_t *cam)
     }
 
     fprintf(stderr, "[ffsdl] decoder=%s mode=%s stream=%dx%d\n",
-            cam->decoder->name,
+            cam->mpp_decoder ? "mpp_direct" : cam->decoder->name,
             cam->hw_decoder ? "hardware" : "software",
             cam->codec_ctx->width, cam->codec_ctx->height);
 
@@ -362,6 +374,7 @@ static int rtsp_open(ml_camera_t *cam)
 static void rtsp_close(ml_camera_t *cam)
 {
     if (cam->rga)         { ml_rga_destroy(cam->rga); cam->rga = NULL; }
+    ml_mpp_decoder_destroy(&cam->mpp_decoder);
     ml_ffmpeg_free(cam->rga_cvt_buf);
     cam->rga_cvt_buf  = NULL;
     cam->rga_cvt_size = 0;
@@ -506,6 +519,57 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
         }
 
         if (pkt->stream_index == cam->video_idx) {
+#ifdef __linux__
+            if (cam->mpp_decoder) {
+                uint8_t *nv12 = NULL;
+                int width = 0;
+                int height = 0;
+                int stride = 0;
+                int vstride = 0;
+
+                ret = ml_mpp_decoder_decode(cam->mpp_decoder,
+                                            pkt->data,
+                                            (size_t)pkt->size,
+                                            pkt->pts,
+                                            &nv12,
+                                            &width,
+                                            &height,
+                                            &stride,
+                                            &vstride);
+                (void)vstride;
+                if (ret < 0) {
+                    ml_ffmpeg_packet_free(&pkt);
+                    return -1;
+                }
+                if (ret > 0) {
+                    av_frame_unref(cam->dec_frame);
+                    cam->dec_frame->format = AV_PIX_FMT_NV12;
+                    cam->dec_frame->width = width;
+                    cam->dec_frame->height = height;
+                    av_image_fill_arrays(cam->dec_frame->data,
+                                         cam->dec_frame->linesize,
+                                         nv12,
+                                         AV_PIX_FMT_NV12,
+                                         width,
+                                         height,
+                                         1);
+                    cam->dec_frame->linesize[0] = stride;
+                    cam->dec_frame->linesize[1] = stride;
+                    cam->dec_frame->pts = pkt->pts;
+                    got_frame = 1;
+                }
+            } else {
+#endif
+#if LIBAVCODEC_VERSION_MAJOR < 59
+            /* FFmpeg 4.3's RKMPP decoder uses the legacy decode callback and
+             * internally drains its packet queue from receive_frame(). */
+            ret = avcodec_decode_video2(cam->codec_ctx, cam->dec_frame,
+                                        &got_frame, pkt);
+            if (ret < 0) {
+                ml_ffmpeg_packet_free(&pkt);
+                return -1;
+            }
+#else
             ret = avcodec_send_packet(cam->codec_ctx, pkt);
             if (ret == 0) {
                 ret = avcodec_receive_frame(cam->codec_ctx, cam->dec_frame);
@@ -530,12 +594,41 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
                     return -1;
                 }
                 /* EAGAIN: decoder needs more packets, loop */
-            } else if (ret != AVERROR(EAGAIN)) {
+            } else if (ret == AVERROR(EAGAIN)) {
+                /* Hardware decoders may report a full input queue.  Drain
+                 * output and retry this same packet; dropping it can starve
+                 * RKMPP indefinitely, especially while waiting for an IDR. */
+                int retry = 100;
+                while (!got_frame && retry-- > 0) {
+                    int out_ret = avcodec_receive_frame(cam->codec_ctx,
+                                                        cam->dec_frame);
+                    if (out_ret == 0) {
+                        got_frame = 1;
+                        break;
+                    }
+                    if (out_ret != AVERROR(EAGAIN)) {
+                        ml_ffmpeg_packet_free(&pkt);
+                        return -1;
+                    }
+                    usleep(1000);
+                    ret = avcodec_send_packet(cam->codec_ctx, pkt);
+                    if (ret == 0)
+                        continue;
+                    if (ret != AVERROR(EAGAIN)) {
+                        ml_ffmpeg_packet_free(&pkt);
+                        return -1;
+                    }
+                }
+            } else {
                 /* send_packet hard error (not EAGAIN) — bail out */
                 ml_ffmpeg_packet_free(&pkt);
                 return -1;
             }
             /* send_packet EAGAIN: decoder buffer full, loop to receive */
+#endif
+#ifdef __linux__
+            }
+#endif
         }
         ml_ffmpeg_packet_free(&pkt);
     }
