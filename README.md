@@ -1,4 +1,4 @@
-# RK3568 FFmpeg + SDL2 RTSP HDMI demo
+# RK3568 FFmpeg + SDL2 RTSP HDMI 输出
 
 本项目播放 H.264/H.265 RTSP 流：FFmpeg 解复用与解码，板端可优先使用
 `h264_rkmpp` / `hevc_rkmpp`；RGA 将图像转换为 BGR888；SDL2 负责显示。
