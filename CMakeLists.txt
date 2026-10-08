@@ -23,6 +23,16 @@ if(NOT EXISTS "${CLIB_ROOT}/Makefile")
 endif()
 
   set(CLIB_MAKE_ARGS DISPLAY_BACKEND=sdl)
+  # clib is built by a nested Makefile, so CMake's toolchain is not
+  # propagated automatically.  Pass the selected compiler explicitly;
+  # otherwise the nested build falls back to the host `gcc` and cannot link
+  # the AArch64 FFmpeg/SDL/RGA libraries.
+  if(CMAKE_C_COMPILER)
+    list(APPEND CLIB_MAKE_ARGS "CC=${CMAKE_C_COMPILER}")
+  endif()
+  if(CMAKE_AR)
+    list(APPEND CLIB_MAKE_ARGS "AR=${CMAKE_AR}")
+  endif()
   if(FFMPEG_ROOT)
     list(APPEND CLIB_MAKE_ARGS "FFMPEG_ROOT=${FFMPEG_ROOT}")
   endif()
