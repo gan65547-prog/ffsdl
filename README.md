@@ -1,7 +1,29 @@
-# RK3568 FFmpeg + SDL2 RTSP HDMI 输出
+# ffsdl：Rockchip 板端 RTSP 硬解码与 HDMI 播放示例
 
-本项目播放 H.264/H.265 RTSP 流：FFmpeg 负责解复用，Linux 板端优先直接调用
-Rockchip MPP 做硬件解码；RGA 将图像转换为 BGR888；SDL2 负责显示。
+`ffsdl` 是面向 Rockchip ARM64 Linux 板卡的 RTSP 播放示例：FFmpeg 负责拉流和解复用，
+程序优先调用 Rockchip MPP 进行硬件解码，再通过 RGA 转换图像格式，最后由 SDL2 输出到
+HDMI。让网络视频流从 RTSP 地址直达板端屏幕。
+
+项目支持 H.264/H.265 RTSP 流，并提供 FFmpeg 4.3 和 6.1 两种 ABI 配置。即使 FFmpeg
+自身没有集成 RKMPP 解码器，也可以使用项目的直接 MPP 解码路径。仓库还包含精简的 RTSP、
+帧池、MPP/RGA 与 SDL2 适配代码，以及构建、运行和板端部署说明，适合验证 Rockchip 上的
+硬解码与 KMS/DRM 显示链路，或作为 C 语言实现参考。
+
+项目已在 108（aarch64）板端完成 FFmpeg 4.3 构建、dummy 显示测试和真实 RTSP 拉流测试；
+FFmpeg 6.1 配置也通过了本机编译和 CTest 兼容性检查。具体环境要求、构建命令和运行方法
+见下文。
+
+## 项目结构
+
+- `src/clib_rtsp_sdl_player.c`：播放器入口。
+- `clib/`：本示例使用的 RTSP、帧池、Rockchip MPP/RGA 与 SDL2 适配代码。
+- `include/ffsdl_ffmpeg43.h`：FFmpeg ABI 兼容处理。
+- `tests/`：RGA 与 SDL 显示相关检查程序。
+
+## 开源许可
+
+本项目包含第三方组件及其头文件、运行库。开源或再分发前，请查看各组件随附的许可证，
+并遵守相应的版权声明和再分发条件。`clib/` 的许可证见 [`clib/LICENSE`](clib/LICENSE)。
 
 入口是 `src/clib_rtsp_sdl_player.c`。`clib/` 是仅包含本 demo 所需 RTSP、帧池、
 RKMPP/RGA 与 SDL2 适配代码的最小提取。FFmpeg 4.3 起的 ABI 要求由项目的
