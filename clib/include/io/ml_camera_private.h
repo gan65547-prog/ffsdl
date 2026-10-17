@@ -99,6 +99,15 @@ struct ml_camera_s {
     /* Frames the decoder produced despite concealment errors — the visible
      * tail of everything AV_EF_IGNORE_ERR / discard-corrupt swallows. */
     uint64_t         corrupt_frames;
+    uint64_t         rtsp_packets;
+    uint64_t         rtsp_video_packets;
+    uint64_t         decoder_frames;
+    uint64_t         decoder_no_frame;
+    uint64_t         rga_frames;
+    uint64_t         rga_errors;
+    uint64_t         swscale_frames;
+    uint64_t         pts_backwards;
+    int64_t           last_pts_us;
 #endif
 
 #if defined(ML_CAMERA_HAS_FILE)

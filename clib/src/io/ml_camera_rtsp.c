@@ -39,14 +39,29 @@
 
 static void *rtsp_thread(void *arg);
 
-/* Frame release callback: frees per-read buffer allocated for UAF safety
- * (see clib audit M4 — internal rga_cvt_buf / rgb_buf are reused each frame). */
+static void rtsp_log_stats(ml_camera_t *cam, const char *event)
+{
+    fprintf(stderr,
+            "[rtsp] %s packets=%llu video=%llu decoded=%llu no_frame=%llu "
+            "rga_ok=%llu rga_fail=%llu swscale=%llu pts_backwards=%llu\n",
+            event,
+            (unsigned long long)cam->rtsp_packets,
+            (unsigned long long)cam->rtsp_video_packets,
+            (unsigned long long)cam->decoder_frames,
+            (unsigned long long)cam->decoder_no_frame,
+            (unsigned long long)cam->rga_frames,
+            (unsigned long long)cam->rga_errors,
+            (unsigned long long)cam->swscale_frames,
+            (unsigned long long)cam->pts_backwards);
+}
+
+/* Frame release callback for the software fallback's caller-owned copy. */
 static void rtsp_frame_release(void *owner, ml_frame_t *f)
 {
-    (void)owner;
-    if (f) {
+    ml_camera_t *cam = (ml_camera_t *)owner;
+    if (cam && cam->pool && f) {
         for (int i = 0; i < 3; i++) {
-            if (f->data[i]) ml_ffmpeg_free(f->data[i]);
+            if (f->data[i]) cam->pool->f_free(cam->pool, f->data[i]);
         }
     }
 }
@@ -61,8 +76,9 @@ static int rga_nv12_to_bgr(ml_camera_t *cam)
 
     /* allocate BGR output buffer if needed */
     if (!cam->rga_cvt_buf || cam->rga_cvt_size < bgr_size) {
-        ml_ffmpeg_free(cam->rga_cvt_buf);
-        cam->rga_cvt_buf = ml_ffmpeg_alloc(bgr_size);
+        if (cam->rga_cvt_buf)
+            cam->pool->f_free(cam->pool, cam->rga_cvt_buf);
+        cam->rga_cvt_buf = cam->pool->f_alloc(cam->pool, bgr_size);
         if (!cam->rga_cvt_buf)
             return -1;
         cam->rga_cvt_size = bgr_size;
@@ -73,7 +89,7 @@ static int rga_nv12_to_bgr(ml_camera_t *cam)
     int uv_size = cam->dec_frame->linesize[1] * h / 2;
 
     /* RGA works with continuous buffers — copy Y and UV */
-    uint8_t *nv12_buf = (uint8_t *)ml_ffmpeg_alloc(y_size + uv_size);
+    uint8_t *nv12_buf = (uint8_t *)cam->pool->f_alloc(cam->pool, y_size + uv_size);
     if (!nv12_buf)
         return -1;
 
@@ -88,11 +104,61 @@ static int rga_nv12_to_bgr(ml_camera_t *cam)
     int ret = ml_rga_csc(cam->rga,
                          nv12_buf, w, h, ML_RGA_FMT_NV12,
                          cam->rga_cvt_buf, ML_RGA_FMT_BGR888);
-    ml_ffmpeg_free(nv12_buf);
+    cam->pool->f_free(cam->pool, nv12_buf);
     return ret;
 }
 
 #include <sys/stat.h>
+
+/* Detect an IDR/keyframe access unit in Annex-B data (H.264 NAL type 5,
+ * HEVC NAL types 19/20).  Used to gate display output until the decoder
+ * has a real reference picture. */
+static int avc_hevc_has_idr(const uint8_t *d, size_t n, int hevc)
+{
+    size_t i;
+    int zeros = 0;
+
+    for (i = 0; i < n; i++) {
+        if (d[i] == 0) {
+            zeros++;
+            continue;
+        }
+        if (d[i] == 1 && zeros >= 2 && i + 1 < n) {
+            unsigned char nal_hdr = d[i + 1];
+            if (!hevc) {
+                if ((nal_hdr & 0x1F) == 5)
+                    return 1;
+            } else {
+                unsigned nal_type = ((unsigned)nal_hdr >> 1) & 0x3F;
+                if (nal_type == 19 || nal_type == 20)
+                    return 1;
+            }
+        }
+        zeros = 0;
+    }
+    return 0;
+}
+
+/* Detect the solid-green image that zeroed NV12 produces after CSC
+ * (BT.601 full range maps YUV 0,0,0 to RGB 0,135,0).  MPP hands out
+ * never-written frame buffers around mid-GOP joins, and loss-of-signal
+ * encoders emit the same pattern.  buf holds packed BGR888. */
+static int bgr_solid_green(const void *buf, int w, int h)
+{
+    const unsigned char *p = (const unsigned char *)buf;
+    size_t npix, step, i, green = 0, samples = 0;
+
+    if (!p || w <= 0 || h <= 0)
+        return 0;
+    npix = (size_t)w * (size_t)h;
+    step = npix / 256 + 1;
+    for (i = 0; i < npix; i += step, samples++) {
+        const unsigned char *px = p + i * 3;
+        if (px[0] <= 8 && px[2] <= 8 && px[1] >= 127 && px[1] <= 143)
+            green++;
+    }
+    return samples > 0 && green * 20 > samples * 19;
+}
 
 /* check if a V4L2 decoder device node is functional.
  * On some Rockchip vendor kernels, /dev/video-dec0 is a regular file (not a
@@ -141,7 +207,6 @@ static int rtsp_open(ml_camera_t *cam)
      * starve H.264 reference frames and produce macroblock corruption. */
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
     av_dict_set(&opts, "stimeout",       "3000000", 0);
-    av_dict_set(&opts, "fflags",         "discardcorrupt", 0);
     av_dict_set(&opts, "flags",          "low_delay", 0);
     av_dict_set(&opts, "max_delay",      "500000", 0);
     av_dict_set(&opts, "analyzeduration","1000000", 0);
@@ -160,17 +225,16 @@ static int rtsp_open(ml_camera_t *cam)
     ret = avformat_open_input(&cam->fmt_ctx, cam->cfg.device, NULL, &opts);
     ml_ffmpeg_dict_free(&opts);
     if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "[rtsp] avformat_open_input ret=%d (%s) url=%s\n",
+                ret, errbuf, cam->cfg.device);
         /* FFmpeg >= 4.0: avformat_open_input may leave partial allocations
          * in fmt_ctx on failure; caller must still close it. */
         avformat_close_input(&cam->fmt_ctx);
         ml_camera_set_err(cam, "avformat_open_input failed");
         return -1;
     }
-
-    /* Drop packets marked corrupt by the demuxer.  A subscriber can attach
-     * in the middle of a GOP; those packets are unusable until the next IDR
-     * and must not enter the decoder's reference queue. */
-    cam->fmt_ctx->flags |= AVFMT_FLAG_DISCARD_CORRUPT;
 
     ret = avformat_find_stream_info(cam->fmt_ctx, NULL);
     if (ret < 0) {
@@ -219,7 +283,7 @@ static int rtsp_open(ml_camera_t *cam)
 #ifdef __linux__
     if (allow_hw && (codecpar->codec_id == AV_CODEC_ID_H264 ||
                      codecpar->codec_id == AV_CODEC_ID_HEVC)) {
-        cam->mpp_decoder = ml_mpp_decoder_create(codecpar->codec_id);
+        cam->mpp_decoder = ml_mpp_decoder_create(codecpar->codec_id, cam->pool);
     }
 #endif
 
@@ -272,10 +336,6 @@ static int rtsp_open(ml_camera_t *cam)
      * the next keyframe instead of treating the transient as a source fault.
      */
     cam->codec_ctx->err_recognition |= AV_EF_IGNORE_ERR;
-#ifdef AVDISCARD_CORRUPT
-    cam->codec_ctx->skip_frame = AVDISCARD_CORRUPT;
-#endif
-
     /* low-latency flags for software decoder */
     if (!cam->hw_decoder)
         cam->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
@@ -328,7 +388,7 @@ static int rtsp_open(ml_camera_t *cam)
         AV_PIX_FMT_BGR24,
         cam->codec_ctx->width,
         cam->codec_ctx->height, 1);
-    cam->rgb_buf = ml_ffmpeg_alloc(cam->rgb_buf_size);
+    cam->rgb_buf = cam->pool->f_alloc(cam->pool, cam->rgb_buf_size);
     if (!cam->rgb_buf)
         return -1;
 
@@ -354,7 +414,10 @@ static int rtsp_open(ml_camera_t *cam)
         cam->rga = ml_rga_create(cam->pool);
         if (!cam->rga) {
             /* RGA create failed — will use swscale fallback */
+            fprintf(stderr, "[ffsdl] RGA init failed; software conversion fallback\n");
         }
+    } else if (cam->hw_decoder) {
+        fprintf(stderr, "[ffsdl] RGA device unavailable; software conversion fallback\n");
     }
 
     /* RTSP must continuously drain the demuxer.  Sleeping before
@@ -375,12 +438,12 @@ static void rtsp_close(ml_camera_t *cam)
 {
     if (cam->rga)         { ml_rga_destroy(cam->rga); cam->rga = NULL; }
     ml_mpp_decoder_destroy(&cam->mpp_decoder);
-    ml_ffmpeg_free(cam->rga_cvt_buf);
+    if (cam->rga_cvt_buf) cam->pool->f_free(cam->pool, cam->rga_cvt_buf);
     cam->rga_cvt_buf  = NULL;
     cam->rga_cvt_size = 0;
 
     if (cam->sws)         { sws_freeContext(cam->sws); cam->sws = NULL; }
-    if (cam->rgb_buf)     { ml_ffmpeg_free(cam->rgb_buf); cam->rgb_buf = NULL; }
+    if (cam->rgb_buf)     { cam->pool->f_free(cam->pool, cam->rgb_buf); cam->rgb_buf = NULL; }
     if (cam->rgb_frame)   { ml_ffmpeg_frame_free(&cam->rgb_frame); }
     if (cam->dec_frame)   { ml_ffmpeg_frame_free(&cam->dec_frame); }
     if (cam->sw_frame)    { ml_ffmpeg_frame_free(&cam->sw_frame); }
@@ -486,7 +549,12 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
 {
     AVPacket *pkt = NULL;
     int ret, got_frame = 0;
+    int max_tries;
     uint64_t frame_ts;
+#ifdef __linux__
+    ml_mpp_decoded_frame_t mpp_frame = { .fd = -1 };
+    int got_mpp_frame = 0;
+#endif
 
     /* wall-clock fallback when decoder PTS is unavailable */
     {
@@ -499,8 +567,10 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
      * Without a max_tries cap, avcodec_receive_frame returning
      * persistent EAGAIN (decoder buffer not full) or the upstream
      * sending a long run of non-video packets would spin forever,
-     * blocking rtsp_thread and stalling stop()'s join. */
-    int max_tries = 500;  /* generous: ~16s at 30fps, longer if av_read_frame blocks */
+     * blocking rtsp_thread and stalling stop()'s join.  Solid-green
+     * frames re-enter this loop at read_more. */
+read_more:
+    max_tries = 500;  /* generous: ~16s at 30fps, longer if av_read_frame blocks */
     while (!got_frame) {
         if (--max_tries <= 0) {
             /* pkt is either NULL (first iter) or already freed by prior
@@ -514,49 +584,61 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
 
         ret = av_read_frame(cam->fmt_ctx, pkt);
         if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            fprintf(stderr, "[rtsp] av_read_frame ret=%d (%s)\n", ret, errbuf);
+            rtsp_log_stats(cam, "av_read_frame failed");
             ml_ffmpeg_packet_free(&pkt);
             return -1;
         }
+        cam->rtsp_packets++;
 
         if (pkt->stream_index == cam->video_idx) {
+            cam->rtsp_video_packets++;
 #ifdef __linux__
             if (cam->mpp_decoder) {
-                uint8_t *nv12 = NULL;
-                int width = 0;
-                int height = 0;
-                int stride = 0;
-                int vstride = 0;
-
-                ret = ml_mpp_decoder_decode(cam->mpp_decoder,
-                                            pkt->data,
-                                            (size_t)pkt->size,
-                                            pkt->pts,
-                                            &nv12,
-                                            &width,
-                                            &height,
-                                            &stride,
-                                            &vstride);
-                (void)vstride;
+                static int idr_logged;
+                if (!idr_logged &&
+                    avc_hevc_has_idr(pkt->data, (size_t)pkt->size,
+                                     cam->codec_ctx->codec_id == AV_CODEC_ID_HEVC)) {
+                    idr_logged = 1;
+                    fprintf(stderr, "[rtsp] first IDR at video packet #%llu\n",
+                            (unsigned long long)cam->rtsp_video_packets);
+                }
+                /* Feed MPP the decode-order (DTS) timestamp: the reorder
+                 * queue expects monotonic input ordering, and RTSP packet
+                 * PTS from B-frame sources is non-monotonic. */
+                int64_t mpp_pts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts
+                                                             : pkt->pts;
+                ret = ml_mpp_decoder_decode_dmabuf(cam->mpp_decoder,
+                                                   pkt->data,
+                                                   (size_t)pkt->size,
+                                                   mpp_pts, &mpp_frame);
                 if (ret < 0) {
+                    rtsp_log_stats(cam, "MPP decode failed");
                     ml_ffmpeg_packet_free(&pkt);
                     return -1;
                 }
                 if (ret > 0) {
+                    cam->decoder_frames++;
+                    got_mpp_frame = 1;
                     av_frame_unref(cam->dec_frame);
                     cam->dec_frame->format = AV_PIX_FMT_NV12;
-                    cam->dec_frame->width = width;
-                    cam->dec_frame->height = height;
+                    cam->dec_frame->width = mpp_frame.width;
+                    cam->dec_frame->height = mpp_frame.height;
                     av_image_fill_arrays(cam->dec_frame->data,
                                          cam->dec_frame->linesize,
-                                         nv12,
+                                         mpp_frame.data,
                                          AV_PIX_FMT_NV12,
-                                         width,
-                                         height,
+                                         mpp_frame.width,
+                                         mpp_frame.height,
                                          1);
-                    cam->dec_frame->linesize[0] = stride;
-                    cam->dec_frame->linesize[1] = stride;
-                    cam->dec_frame->pts = pkt->pts;
+                    cam->dec_frame->linesize[0] = mpp_frame.hor_stride;
+                    cam->dec_frame->linesize[1] = mpp_frame.hor_stride;
+                    cam->dec_frame->pts = mpp_frame.pts;
                     got_frame = 1;
+                } else {
+                    cam->decoder_no_frame++;
                 }
             } else {
 #endif
@@ -633,6 +715,108 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
         ml_ffmpeg_packet_free(&pkt);
     }
 
+#ifdef __linux__
+    /* MPP's decoded NV12 and the RGA target are both DMA-BUFs.  This is the
+     * only RTSP path that avoids the old MPP->heap copy and heap->RGA copy. */
+    if (got_mpp_frame && cam->rga) {
+        ml_mpp_decoded_frame_t output = { .fd = -1 };
+        size_t output_size = (size_t)mpp_frame.width * mpp_frame.height * 3U;
+        if (ml_mpp_decoder_acquire_output_dmabuf(cam->mpp_decoder,
+                                                 output_size, &output) == 0 &&
+            ml_rga_nv12_to_bgr_dmabuf(cam->rga,
+                                      mpp_frame.fd,
+                                      mpp_frame.width, mpp_frame.height,
+                                      mpp_frame.hor_stride,
+                                      mpp_frame.ver_stride,
+                                      output.fd,
+                                      mpp_frame.width, mpp_frame.height) == 0) {
+            /* Sample the RGA output inside a fresh read-sync window: CPU
+             * reads of this DMA-BUF are only guaranteed coherent there. */
+            {
+                int green;
+                ml_mpp_decoder_output_sync(cam->mpp_decoder, 1);
+                green = bgr_solid_green(output.data,
+                                        mpp_frame.width, mpp_frame.height);
+                ml_mpp_decoder_output_sync(cam->mpp_decoder, 0);
+                if (green) {
+                    static unsigned green_count;
+                    if ((green_count++ & 63) == 0)
+                        fprintf(stderr, "[rtsp] skip solid-green frame #%u\n",
+                                green_count);
+                    got_frame = 0;
+                    got_mpp_frame = 0;
+                    goto read_more;
+                }
+            }
+            AVRational tb = cam->fmt_ctx->streams[cam->video_idx]->time_base;
+            int64_t pts_us = av_rescale_q(mpp_frame.pts, tb, AV_TIME_BASE_Q);
+            if (mpp_frame.pts != AV_NOPTS_VALUE && pts_us > 0 &&
+                pts_us < (INT64_MAX / 2))
+                frame_ts = (uint64_t)pts_us;
+            if (mpp_frame.pts != AV_NOPTS_VALUE && pts_us > 0) {
+                if (cam->last_pts_us > 0 && pts_us < cam->last_pts_us)
+                    cam->pts_backwards++;
+                cam->last_pts_us = pts_us;
+            }
+            cam->rga_frames++;
+            if ((cam->rga_frames % 100) == 0)
+                rtsp_log_stats(cam, "direct dmabuf frame");
+            ml_frame_from_mem(frame, output.data, output_size,
+                              (uint32_t)mpp_frame.width,
+                              (uint32_t)mpp_frame.height,
+                              ML_PIXFMT_BGR888, frame_ts, 0);
+            frame->fd[0] = output.fd;
+            frame->flags |= ML_FRAME_FLAG_DMABUF | ML_FRAME_FLAG_READ_SYNC;
+            {
+                static unsigned dump_n;
+                const char *dump_env = getenv("FFSDL_DUMP_FRAMES");
+                unsigned dump_max = dump_env ? (unsigned)atoi(dump_env) : 0;
+                if (dump_max && dump_n < dump_max) {
+                    char path[64];
+                    unsigned char *row =
+                        (unsigned char *)malloc((size_t)frame->width * 3);
+                    snprintf(path, sizeof(path), "/tmp/ffsdl_frame_%03u.ppm",
+                             dump_n);
+                    if (row) {
+                        FILE *fp = fopen(path, "wb");
+                        if (fp) {
+                            const unsigned char *src =
+                                (const unsigned char *)output.data;
+                            unsigned r, c;
+                            ml_mpp_decoder_output_sync(cam->mpp_decoder, 1);
+                            fprintf(fp, "P6\n%u %u\n255\n",
+                                    frame->width, frame->height);
+                            for (r = 0; r < frame->height; r++) {
+                                const unsigned char *line =
+                                    src + (size_t)r * frame->width * 3;
+                                for (c = 0; c < frame->width; c++) {
+                                    row[c * 3 + 0] = line[c * 3 + 2];
+                                    row[c * 3 + 1] = line[c * 3 + 1];
+                                    row[c * 3 + 2] = line[c * 3 + 0];
+                                }
+                                fwrite(row, 1, (size_t)frame->width * 3, fp);
+                            }
+                            ml_mpp_decoder_output_sync(cam->mpp_decoder, 0);
+                            fclose(fp);
+                            fprintf(stderr, "[ffsdl] dumped %s\n", path);
+                        }
+                        free(row);
+                    }
+                    dump_n++;
+                }
+            }
+            /* CPU reads this DMA-BUF next (SDL texture update); open the
+             * read-sync window so the display sees RGA's writes, not stale
+             * cache lines.  It is closed at the next decode call. */
+            ml_mpp_decoder_output_sync(cam->mpp_decoder, 1);
+            return 0;
+        }
+        cam->rga_errors++;
+        if ((cam->rga_errors % 10) == 1)
+            rtsp_log_stats(cam, "RGA dmabuf conversion failed");
+    }
+#endif
+
     /* convert decoder PTS (stream timebase) → microseconds.
      * Only trust PTS when the converted value is within a sane range;
      * RTSP/RTP timestamps can be random 32-bit rollover values that
@@ -640,22 +824,30 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
     if (cam->dec_frame->pts != AV_NOPTS_VALUE) {
         AVRational tb = cam->fmt_ctx->streams[cam->video_idx]->time_base;
         int64_t pts_us = av_rescale_q(cam->dec_frame->pts, tb, AV_TIME_BASE_Q);
-        if (pts_us > 0 && pts_us < (INT64_MAX / 2))
+        if (pts_us > 0 && pts_us < (INT64_MAX / 2)) {
+            if (cam->last_pts_us > 0 && pts_us < cam->last_pts_us)
+                cam->pts_backwards++;
             frame_ts = (uint64_t)pts_us;
+            cam->last_pts_us = pts_us;
+        }
     }
 
     /* Hardware decoders can return opaque DRM_PRIME frames.  Transfer them
-     * to ordinary system memory before RGA/swscale touches the planes. */
-    if (cam->hw_decoder && cam->dec_frame->format == AV_PIX_FMT_DRM_PRIME) {
+     * to ordinary system memory before RGA/swscale touches the planes.
+     * The direct MPP path instead builds dec_frame around a held DMA-BUF;
+     * it deliberately has no AVBufferRef, so av_frame_ref() is invalid. */
+    if (cam->hw_decoder && !cam->mpp_decoder &&
+        cam->dec_frame->format == AV_PIX_FMT_DRM_PRIME) {
         if (av_hwframe_transfer_data(cam->sw_frame, cam->dec_frame, 0) < 0)
             return -1;
-    } else if (cam->hw_decoder) {
+    } else if (cam->hw_decoder && !cam->mpp_decoder) {
         av_frame_unref(cam->sw_frame);
         if (av_frame_ref(cam->sw_frame, cam->dec_frame) < 0)
             return -1;
     }
 
-    AVFrame *convert_frame = cam->hw_decoder ? cam->sw_frame : cam->dec_frame;
+    AVFrame *convert_frame = (cam->hw_decoder && !cam->mpp_decoder)
+                           ? cam->sw_frame : cam->dec_frame;
 
     if (cam->hw_decoder && !cam->sws) {
         cam->sws = sws_getContext(
@@ -670,6 +862,15 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
     /* color conversion: RGA (hw) preferred, swscale fallback */
     if (cam->rga && cam->dec_frame->format != AV_PIX_FMT_DRM_PRIME) {
         if (rga_nv12_to_bgr(cam) == 0) {
+            if (bgr_solid_green(cam->rga_cvt_buf, cam->codec_ctx->width,
+                                cam->codec_ctx->height)) {
+                static unsigned green_count;
+                if ((green_count++ & 63) == 0)
+                    fprintf(stderr, "[rtsp] skip solid-green frame #%u\n",
+                            green_count);
+                got_frame = 0;
+                goto read_more;
+            }
             ml_frame_from_mem(
                 frame,
                 cam->rga_cvt_buf, cam->rga_cvt_size,
@@ -681,11 +882,12 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
              * any caller holding a frame reference after the next read()
              * would read overwritten data. */
             {
-                void *copy = ml_ffmpeg_alloc(frame->size[0]);
+                void *copy = cam->pool->f_alloc(cam->pool, frame->size[0]);
                 if (!copy)
                     return -1;
                 memcpy(copy, frame->data[0], frame->size[0]);
                 frame->data[0] = copy;
+                frame->owner = cam;
                 frame->release = rtsp_frame_release;
             }
             return 0;
@@ -700,6 +902,15 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
               cam->codec_ctx->height,
               cam->rgb_frame->data, cam->rgb_frame->linesize);
 
+    if (bgr_solid_green(cam->rgb_buf, cam->codec_ctx->width,
+                        cam->codec_ctx->height)) {
+        static unsigned green_count;
+        if ((green_count++ & 63) == 0)
+            fprintf(stderr, "[rtsp] skip solid-green frame #%u\n", green_count);
+        got_frame = 0;
+        goto read_more;
+    }
+
     ml_frame_from_mem(
         frame,
         cam->rgb_buf, cam->rgb_buf_size,
@@ -709,13 +920,18 @@ static int rtsp_read_internal(ml_camera_t *cam, ml_frame_t *frame)
 
     /* Same UAF-safety copy for swscale path */
     {
-        void *copy = ml_ffmpeg_alloc(frame->size[0]);
+        void *copy = cam->pool->f_alloc(cam->pool, frame->size[0]);
         if (!copy)
             return -1;
         memcpy(copy, frame->data[0], frame->size[0]);
         frame->data[0] = copy;
+        frame->owner = cam;
         frame->release = rtsp_frame_release;
     }
+
+    cam->swscale_frames++;
+    if ((cam->swscale_frames % 100) == 0)
+        rtsp_log_stats(cam, "swscale frame");
 
     return 0;
 }
@@ -727,6 +943,29 @@ ml_camera_rtsp_read(ml_camera_t *cam, ml_frame_t *frame, int timeout_ms)
 
     if (!cam || !frame)
         return -1;
+    /* Synchronous callers do not have a worker thread to perform the next
+     * reconnect attempt.  Leave the camera restartable after a failed open. */
+    if (cam->state == ML_CAMERA_STATE_ERROR && !cam->fmt_ctx) {
+        /* Pace repeated open attempts with the same exponential backoff as
+         * the read-failure path: a tight caller loop (100 ms poll) would
+         * otherwise burn the caller's retry budget in seconds while the
+         * publisher is down. */
+        for (int d = cam->reconnect_delay * 10;
+             d > 0 && !cam->interrupt_requested; d--)
+            usleep(100000);
+        if (cam->interrupt_requested)
+            return -1;
+        if (cam->reconnect_delay < 30)
+            cam->reconnect_delay *= 2;
+        if (rtsp_open(cam) == 0) {
+            cam->state = ML_CAMERA_STATE_RUNNING;
+            cam->reconnect_delay = 1;
+        } else {
+            rtsp_close(cam);
+            cam->state = ML_CAMERA_STATE_ERROR;
+            return -1;
+        }
+    }
     if (cam->state != ML_CAMERA_STATE_RUNNING)
         return -1;
 
@@ -756,14 +995,18 @@ ml_camera_rtsp_read(ml_camera_t *cam, ml_frame_t *frame, int timeout_ms)
         /* auto-reconnect */
         rtsp_close(cam);
         cam->state = ML_CAMERA_STATE_ERROR;
+        /* The previous read deadline belongs only to the failed I/O call.
+         * Keeping it active makes avformat_open_input abort immediately on
+         * every reconnect with AVERROR_EXIT. */
+        cam->deadline_us = 0;
 
         /* interruptible sleep — check thread_running every 100 ms
          * so that stop() can join the thread without blocking for up
          * to 30 s (worst-case exponential backoff). */
         for (int d = cam->reconnect_delay * 10;
-             d > 0 && cam->thread_running; d--)
+             d > 0 && !cam->interrupt_requested; d--)
             usleep(100000);
-        if (!cam->thread_running)
+        if (cam->interrupt_requested)
             return -1;
 
         if (cam->reconnect_delay < 30)
@@ -776,6 +1019,8 @@ ml_camera_rtsp_read(ml_camera_t *cam, ml_frame_t *frame, int timeout_ms)
             /* rtsp_open made partial allocations before failing;
              * must clean them up so they don't accumulate on retries. */
             rtsp_close(cam);
+            /* Keep the object eligible for a later synchronous retry. */
+            cam->state = ML_CAMERA_STATE_ERROR;
         }
         return -1;
     }

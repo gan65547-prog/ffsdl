@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void usage(const char *program)
 {
@@ -23,6 +24,7 @@ int main(int argc, char **argv)
     ml_camera_t *camera;
     ml_display_t *display;
     unsigned long frame_count = 0;
+    unsigned int read_failures = 0;
 
     if (argc < 2 || argc > 3) {
         usage(argv[0]);
@@ -61,9 +63,17 @@ int main(int argc, char **argv)
         ml_frame_t frame;
         memset(&frame, 0, sizeof(frame));
         if (ml_camera_read(camera, &frame, camera_cfg.timeout_ms) != 0) {
-            fprintf(stderr, "RTSP read failed: %s\n", ml_camera_error(camera));
+            read_failures++;
+            fprintf(stderr, "[ffsdl] RTSP read failed (%u), reconnecting: %s\n",
+                    read_failures, ml_camera_error(camera));
+            if (read_failures < 20) {
+                usleep(100000);
+                continue;
+            }
+            fprintf(stderr, "[ffsdl] RTSP read failed 20 consecutive times; stopping\n");
             break;
         }
+        read_failures = 0;
         if (ml_display_show_frame(display, &frame, NULL, 0, NULL, 0) != 0) {
             fprintf(stderr, "SDL display stopped: %s\n", ml_display_error(display));
             ml_camera_frame_release(camera, &frame);
@@ -71,9 +81,10 @@ int main(int argc, char **argv)
         }
         frame_count++;
         if (frame_count == 1 || frame_count % 100 == 0) {
-            fprintf(stderr, "[ffsdl] frames=%lu output=%ux%u %s\n",
+            fprintf(stderr, "[ffsdl] frames=%lu output=%ux%u %s dmabuf=%s\n",
                     frame_count, frame.width, frame.height,
-                    ml_pixfmt_name((ml_pixfmt_t)frame.format));
+                    ml_pixfmt_name((ml_pixfmt_t)frame.format),
+                    (frame.flags & ML_FRAME_FLAG_DMABUF) ? "yes" : "no");
         }
         ml_camera_frame_release(camera, &frame);
     }
