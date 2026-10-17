@@ -210,6 +210,13 @@ int  ml_rga_nv12_to_bgr(ml_rga_t *rga,
                          int src_hor_stride, int src_ver_stride,
                          void *dst, int dst_w, int dst_h);
 
+/* Fully DMA-BUF backed NV12 → BGR888.  Both buffers are addressed by fd;
+ * neither source nor destination is copied through a process heap buffer. */
+int  ml_rga_nv12_to_bgr_dmabuf(ml_rga_t *rga,
+                                int src_fd, int src_w, int src_h,
+                                int src_hor_stride, int src_ver_stride,
+                                int dst_fd, int dst_w, int dst_h);
+
 /* NV16 → BGR888 using im2d (full-range BT.601).  Same as nv12_to_bgr but
  * for 4:2:2 semi-planar YUV.  src_ver_stride is typically = src_h (aligned). */
 int  ml_rga_nv16_to_bgr(ml_rga_t *rga,

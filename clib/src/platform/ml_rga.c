@@ -731,6 +731,35 @@ ml_rga_nv12_to_bgr(ml_rga_t *rga,
     return 0;
 }
 
+int
+ml_rga_nv12_to_bgr_dmabuf(ml_rga_t *rga,
+                           int src_fd, int src_w, int src_h,
+                           int src_hor_stride, int src_ver_stride,
+                           int dst_fd, int dst_w, int dst_h)
+{
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS ret;
+
+    if (!rga || !rga->inited || src_fd < 0 || dst_fd < 0 ||
+        src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
+        src_hor_stride < src_w || src_ver_stride < src_h)
+        return -1;
+
+    src_buf = wrapbuffer_fd_t(src_fd, src_w, src_h,
+                              src_hor_stride, src_ver_stride,
+                              RK_FORMAT_YCbCr_420_SP);
+    dst_buf = wrapbuffer_fd_t(dst_fd, dst_w, dst_h,
+                              dst_w, dst_h, RK_FORMAT_BGR_888);
+    ret = imcvtcolor_t(src_buf, dst_buf,
+                       RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888,
+                       IM_YUV_TO_RGB_BT601_FULL, 1);
+    if (ret != IM_STATUS_SUCCESS) {
+        set_err(rga, "imcvtcolor DMA-BUF NV12->BGR failed");
+        return -1;
+    }
+    return 0;
+}
+
 /* ── NV16 → BGR888 via im2d imcvtcolor (full-range BT.601) ──────────── */
 
 int
