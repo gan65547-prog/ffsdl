@@ -162,10 +162,18 @@ cmake --build build-43 -j
 
 ## 板端运行
 
-项目的 `third_party/lib/aarch64-linux-gnu` 包含 ARM64 运行所需的共享库，包括
-SDL2、RGA、Rockchip MPP、DRM/GBM/EGL、Rockchip Mesa DRI；选定版本的 FFmpeg
-运行库位于对应的 `third_party/ffmpeg-4.3/lib` 或 `third_party/ffmpeg-6.1/lib`，
-以及其非 glibc 传递依赖。该目录只能用于 ARM64 Linux，不能在 macOS 或其他架构上直接使用。
+项目的 `third_party/lib/aarch64-linux-gnu` 包含部分 ARM64 运行库，包括
+SDL2、RGA、Rockchip MPP 和 Rockchip Mesa DRI；DRM/GBM/EGL 由板端系统提供。选定版本的 FFmpeg
+运行库位于对应的 `third_party/ffmpeg-4.3/lib` 或 `third_party/ffmpeg-6.1/lib`。
+仓库只收录实际存在的板端库和有效符号链接；其他传递依赖由板端系统提供。该目录只能用于
+ARM64 Linux，不能在 macOS 或其他架构上直接使用。`libLLVM-14.so.1` 使用 Git LFS
+保存，首次克隆需安装 Git LFS 并运行 `git lfs pull`，否则驱动文件无法正常加载。
+
+在源码目录可先检查已提交运行库的文件类型和链接：
+
+```bash
+python3 scripts/check-runtime-bundle.py
+```
 
 HDMI/KMS 输出依赖以下运行库和设备权限：`libsdl2-2.0-0`、`libdrm2`、
 `libgbm1`、`libegl1`、`libegl-mesa0`、`libgl1-mesa-dri`、
@@ -212,6 +220,10 @@ scp -r third_party/lib third_party/ffmpeg-4.3/lib \
 export LIBGL_DRIVERS_PATH=/usr/lib/aarch64-linux-gnu/dri
 export EGL_PLATFORM=gbm
 export LD_LIBRARY_PATH=$PWD/third_party/ffmpeg-4.3/lib:$PWD/third_party/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:$PWD:/opt/mlfw-dev/mlfw/lib
+
+# 检查板端实际解析到的动态库；如有 not found，先安装对应的 ARM64 系统包。
+ldd ./ffsdl
+ldd ./libclib.so
 
 # SDL2 显示接口测试（无显示器）
 SDL_VIDEODRIVER=dummy ./test_clib_sdl_display

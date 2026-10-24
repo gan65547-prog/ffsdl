@@ -6,6 +6,8 @@
 /clib/libclib.a
 /.DS_Store
 **/.DS_Store
+__pycache__/
+*.pyc
 *.core
 *.dSYM/
 # Board image/runtime bundle; contains large system libraries (including LLVM).
