@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 
 struct ml_mpp_decoder_s {
     MppCtx ctx;
